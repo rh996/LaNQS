@@ -1,8 +1,0 @@
-/ferminet
-__pycache__/
-*.pyc
-.DS_Store
-.ropeproject/
-*.egg-info
-*.csv
-*.npz
