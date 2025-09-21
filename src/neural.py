@@ -11,8 +11,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from src.utils import create_position_vectors
-from src.wavefunctions import Wavefunction
+from .utils import create_position_vectors
+from .wavefunctions import Wavefunction
 
 
 class Encoder(nn.Module):
@@ -20,9 +20,12 @@ class Encoder(nn.Module):
     Ny: int
 
     def setup(self):
-        self.position_vectors = jnp.asarray(create_position_vectors(self.Nx, self.Ny))
-        self.G1 = jnp.asarray(np.array([2 * np.pi / self.Nx, 0.0], dtype=np.float32))
-        self.G2 = jnp.asarray(np.array([0.0, 2 * np.pi / self.Ny], dtype=np.float32))
+        self.position_vectors = jnp.asarray(
+            create_position_vectors(self.Nx, self.Ny))
+        self.G1 = jnp.asarray(
+            np.array([2 * np.pi / self.Nx, 0.0], dtype=np.float32))
+        self.G2 = jnp.asarray(
+            np.array([0.0, 2 * np.pi / self.Ny], dtype=np.float32))
         self.n_sites = self.Nx * self.Ny
 
     @nn.compact
@@ -116,6 +119,76 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class FermiMultiHeadAttention(nn.Module):
+    num_heads: int
+    head_dim: int
+    out_dim: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Multi-head attention layout compatible with KFAC."""
+        batch, seq, _ = x.shape
+        proj_dim = self.num_heads * self.head_dim
+        q_proj = nn.Dense(
+            proj_dim,
+            use_bias=False,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )
+        k_proj = nn.Dense(
+            proj_dim,
+            use_bias=False,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )
+        v_proj = nn.Dense(
+            proj_dim,
+            use_bias=False,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )
+
+        q = q_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
+        k = k_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
+        v = v_proj(x).reshape(batch, seq, self.num_heads, self.head_dim)
+
+        attn_logits = jnp.einsum("bqhd,bkhd->bhqk", q, k)
+        attn_logits = attn_logits / jnp.sqrt(self.head_dim)
+        attn_weights = nn.softmax(attn_logits, axis=-1)
+        attn = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v)
+        attn = attn.reshape(batch, seq, -1)
+
+        out = nn.Dense(
+            self.out_dim,
+            use_bias=False,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )(attn)
+        return out
+
+
+class TransformerBlockKFAC(nn.Module):
+    emb_size: int
+    num_heads: int
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Transformer block using KFAC-friendly attention."""
+        if self.emb_size % self.num_heads != 0:
+            raise ValueError(
+                "emb_size must be divisible by num_heads for KFAC Transformer")
+        head_dim = self.emb_size // self.num_heads
+        y = nn.LayerNorm()(x)
+        attn = FermiMultiHeadAttention(
+            num_heads=self.num_heads,
+            head_dim=head_dim,
+            out_dim=self.emb_size,
+        )(y)
+        x = x + attn
+        ff = nn.Dense(
+            self.emb_size,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )(jnp.tanh(x))
+        x = x + ff
+        return x
+
+
 class TransformerNetModel(nn.Module):
     Nx: int
     Ny: int
@@ -134,6 +207,39 @@ class TransformerNetModel(nn.Module):
         )(x)
         for _ in range(self.num_att_blocks):
             x = TransformerBlock(self.emb_size, self.num_heads)(x)
+        x = nn.LayerNorm()(x)
+        x = nn.Dense(
+            self.nelec * self.num_slaters,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )(x)
+        batch, nelec, _ = x.shape
+        x = x.reshape((batch, nelec, self.num_slaters, self.nelec))
+        x = jnp.transpose(x, (0, 2, 1, 3))
+        return x  # (batch, num_slaters, nelec, nelec)
+
+
+class TransformerNetKFACModel(nn.Module):
+    Nx: int
+    Ny: int
+    nelec: int
+    emb_size: int
+    num_heads: int
+    num_att_blocks: int
+    num_slaters: int
+
+    @nn.compact
+    def __call__(self, electrons: jnp.ndarray) -> jnp.ndarray:
+        """Forward pass with attention expressed via KFAC-compatible ops."""
+        if self.emb_size % self.num_heads != 0:
+            raise ValueError(
+                "emb_size must be divisible by num_heads for KFAC Transformer")
+        x = Encoder(self.Nx, self.Ny)(electrons)
+        x = nn.Dense(
+            self.emb_size,
+            kernel_init=nn.initializers.kaiming_normal(),
+        )(x)
+        for _ in range(self.num_att_blocks):
+            x = TransformerBlockKFAC(self.emb_size, self.num_heads)(x)
         x = nn.LayerNorm()(x)
         x = nn.Dense(
             self.nelec * self.num_slaters,
@@ -180,16 +286,19 @@ class NeuralWavefunction(Wavefunction):
 
 
 def save_params(params: Any, path: str | Path) -> None:
+    """Serialize network parameters to disk."""
     path = Path(path)
     payload = serialization.to_bytes(params)
     path.write_bytes(payload)
 
 
 def load_params(path: str | Path, target: Any) -> Any:
+    """Restore parameters from disk into the provided tree."""
     path = Path(path)
     payload = path.read_bytes()
     return serialization.from_bytes(target, payload)
 
 
 def make_optimizer(lr: float) -> optax.GradientTransformation:
+    """Return the default AdamW optimizer used for neural VMC."""
     return optax.adamw(lr)

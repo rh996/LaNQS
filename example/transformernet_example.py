@@ -1,5 +1,3 @@
-"""Run a lightweight SlaterNet VMC calculation and print summary metrics."""
-
 from __future__ import annotations
 
 from src import run_vmc_nqs
@@ -7,24 +5,25 @@ from src import run_vmc_nqs
 
 def main() -> None:
     result = run_vmc_nqs(
-        Nx=4,
-        Ny=4,
+        Nx=6,
+        Ny=6,
         t_hopping=1.0,
         u_interaction=5.0,
-        nelec=4,
-        n_up=2,
-        n_dn=2,
-        total_steps=51000,
+        nelec=20,
+        n_up=10,
+        n_dn=10,
+        total_steps=11000,
         thermalization_steps=1000,
-        optimization_steps=50,
+        optimization_steps=150,
         seed=2,
         lr=1e-2,
-        wf_type="slaternet",
+        wf_type="transformernet",
         thin_stride=10,
-        optimizer_type="kfac"
+        num_slaters=3,
+        optimizer_type="adamw"
     )
 
-    print("SlaterNet example finished")
+    print("TransformerNet example finished")
     print(f"Average energy       : {result.avg_energy:.6f}")
     print(f"Energy std deviation : {result.std_energy:.6f}")
     print(f"Acceptance probability: {result.acceptance:.3f}")

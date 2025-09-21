@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 
 import jax.numpy as jnp
 
-from src.utils import (
+from .utils import (
     double_occupancy_from_electrons,
     neighbour_spin_counts,
 )
