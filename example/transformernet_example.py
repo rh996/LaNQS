@@ -12,7 +12,7 @@ def main() -> None:
         nelec=20,
         n_up=10,
         n_dn=10,
-        total_steps=11000,
+        total_steps=3000,
         thermalization_steps=1000,
         optimization_steps=150,
         seed=2,
@@ -20,7 +20,8 @@ def main() -> None:
         wf_type="transformernet",
         thin_stride=10,
         num_slaters=3,
-        optimizer_type="adamw"
+        optimizer_type="adamw",
+        minibatch_size=512
     )
 
     print("TransformerNet example finished")
