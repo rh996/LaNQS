@@ -174,6 +174,11 @@ def run_vmc(
                 sum_est = sum_est + est
                 sum_e_est = sum_e_est + energy * est
                 return (count, sum_e, sum_e2, buf, ptr, sum_est, sum_e_est)
+            collector_update._cache_key = (
+                "classical_streaming_with_estimator",
+                psi.__class__.__name__,
+                estimator_size,
+            )
         else:
             def collector_update(state, electrons_sample):
                 """Accumulate streamed energy moments for non-optimised ansätze."""
@@ -194,6 +199,10 @@ def run_vmc(
                 )
                 ptr = jnp.minimum(ptr + 1, buf.shape[0])
                 return (count, sum_e, sum_e2, buf, ptr, sum_est, sum_e_est)
+            collector_update._cache_key = (
+                "classical_streaming",
+                psi.__class__.__name__,
+            )
 
         key, electrons, collector_state, acceptance = streaming_metropolis_chain(
             psi,

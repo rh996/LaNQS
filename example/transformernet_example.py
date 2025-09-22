@@ -19,7 +19,10 @@ def main() -> None:
         lr=1e-2,
         wf_type="transformernet",
         thin_stride=10,
-        num_slaters=3,
+        num_att_blocks=3,
+        num_heads=3,
+        num_slaters=4,
+        emb_size=24,
         optimizer_type="adamw",
         minibatch_size=512
     )

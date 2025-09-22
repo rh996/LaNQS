@@ -50,20 +50,39 @@ def _propose_move_spinless(
     n_spin_orbitals: int,
 ) -> Tuple[jax.Array, jnp.ndarray]:
     """Propose a single-orbital move in the spinless setting."""
-    key, key_idx, key_choice = jax.random.split(key, 3)
+    key, key_idx = jax.random.split(key)
     nelec = electrons.shape[0]
     idx = jax.random.randint(key_idx, (), 0, nelec)
-    candidate_pool = jnp.arange(n_spin_orbitals, dtype=jnp.int32)
-    cand_idx = jax.random.randint(key_choice, (), 0, candidate_pool.shape[0])
-    candidate = candidate_pool[cand_idx]
     occ = electron_occupancy(electrons, n_spin_orbitals)
-    new_orb = jax.lax.cond(
-        occ[candidate] == 0,
-        lambda _: candidate,
-        lambda _: electrons[idx],
-        operand=None,
-    )
-    new_electrons = electrons.at[idx].set(new_orb)
+    candidate_pool = jnp.arange(n_spin_orbitals, dtype=jnp.int32)
+    empty_mask = occ[candidate_pool] == 0
+
+    def _draw_candidate(draw_key):
+        draw_key, sample_key = jax.random.split(draw_key)
+        cand_idx = jax.random.randint(sample_key, (), 0, candidate_pool.shape[0])
+        return draw_key, candidate_pool[cand_idx]
+
+    def _sample_move(draw_key):
+        draw_key, candidate = _draw_candidate(draw_key)
+
+        def _cond_fn(state):
+            _, cand = state
+            return occ[cand] == 1
+
+        def _body_fn(state):
+            state_key, _ = state
+            return _draw_candidate(state_key)
+
+        draw_key, candidate = jax.lax.while_loop(
+            _cond_fn, _body_fn, (draw_key, candidate))
+        new_electrons = electrons.at[idx].set(candidate)
+        return draw_key, new_electrons
+
+    def _no_move(draw_key):
+        return draw_key, electrons
+
+    key, new_electrons = jax.lax.cond(
+        jnp.any(empty_mask), _sample_move, _no_move, key)
     return key, new_electrons
 
 
@@ -73,7 +92,7 @@ def _propose_move_spinful(
     n_sites: int,
 ) -> Tuple[jax.Array, jnp.ndarray]:
     """Propose a spin-preserving orbital move."""
-    key, key_idx, key_choice = jax.random.split(key, 3)
+    key, key_idx = jax.random.split(key)
     nelec = electrons.shape[0]
     idx = jax.random.randint(key_idx, (), 0, nelec)
     spin = electrons[idx] % 2
@@ -82,17 +101,36 @@ def _propose_move_spinful(
     odd_orbs = jnp.arange(1, 2 * n_sites, 2, dtype=jnp.int32)
     candidate_pool = jax.lax.cond(
         spin == 0, lambda _: even_orbs, lambda _: odd_orbs, operand=None)
-    cand_idx = jax.random.randint(key_choice, (), 0, candidate_pool.shape[0])
-    candidate = candidate_pool[cand_idx]
 
     occ = electron_occupancy(electrons, 2 * n_sites)
-    new_orb = jax.lax.cond(
-        occ[candidate] == 0,
-        lambda _: candidate,
-        lambda _: electrons[idx],
-        operand=None,
-    )
-    new_electrons = electrons.at[idx].set(new_orb)
+    empty_mask = occ[candidate_pool] == 0
+
+    def _draw_candidate(draw_key):
+        draw_key, sample_key = jax.random.split(draw_key)
+        cand_idx = jax.random.randint(sample_key, (), 0, candidate_pool.shape[0])
+        return draw_key, candidate_pool[cand_idx]
+
+    def _sample_move(draw_key):
+        draw_key, candidate = _draw_candidate(draw_key)
+
+        def _cond_fn(state):
+            _, cand = state
+            return occ[cand] == 1
+
+        def _body_fn(state):
+            state_key, _ = state
+            return _draw_candidate(state_key)
+
+        draw_key, candidate = jax.lax.while_loop(
+            _cond_fn, _body_fn, (draw_key, candidate))
+        new_electrons = electrons.at[idx].set(candidate)
+        return draw_key, new_electrons
+
+    def _no_move(draw_key):
+        return draw_key, electrons
+
+    key, new_electrons = jax.lax.cond(
+        jnp.any(empty_mask), _sample_move, _no_move, key)
     return key, new_electrons
 
 
@@ -379,6 +417,11 @@ def streaming_metropolis_chain(
 
             logabs_fn = _logabs_fn
             logabs_state = psi.params
+            logabs_fn._cache_key = (
+                "neural_logabs",
+                psi.model.__class__.__name__,
+                psi.num_slaters,
+            )
         else:
             def _logabs_fn(_, electrons):
                 logabs, _ = psi.logabs_amplitude(electrons)
@@ -386,13 +429,25 @@ def streaming_metropolis_chain(
 
             logabs_fn = _logabs_fn
             logabs_state = ()
+            logabs_fn._cache_key = (
+                "classical_logabs",
+                psi.__class__.__name__,
+            )
     elif logabs_state is None:
         raise ValueError(
             "logabs_state must be provided when logabs_fn is supplied")
 
+    logabs_cache_key = getattr(logabs_fn, "_cache_key", None)
+    if logabs_cache_key is None:
+        logabs_cache_key = ("logabs_fn", id(logabs_fn))
+
+    collector_cache_key = getattr(collector_update, "_cache_key", None)
+    if collector_cache_key is None:
+        collector_cache_key = ("collector_update", id(collector_update))
+
     cache_key = (
-        id(logabs_fn),
-        id(collector_update),
+        logabs_cache_key,
+        collector_cache_key,
         total_steps,
         thermalization_steps,
         thin_stride,
