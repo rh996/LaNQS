@@ -5,13 +5,15 @@ from typing import Any, Callable, Optional, Tuple
 import jax
 import jax.numpy as jnp
 
-from .neural import NeuralWavefunction
+from .neural import NeuralWavefunction, evaluate_logabs_phase
 
 from .utils import electron_occupancy
 
 
 _KERNEL_CACHE: dict[Tuple[int, int, int, int, int,
                           int, Optional[int], Optional[int]], Callable] = {}
+_STREAMING_KERNEL_CACHE: dict[Tuple[int, int, int, int,
+                                    int, int, int, bool], Callable] = {}
 
 
 def initialize_configuration(
@@ -248,54 +250,45 @@ def _make_metropolis_kernel(
     return jax.jit(_run, static_argnames=())
 
 
-def streaming_metropolis_chain(
-    psi,
-    key: jax.Array,
-    initial_electrons: jnp.ndarray,
+def _make_streaming_kernel(
+    logabs_fn: Callable[[Any, jnp.ndarray], jnp.ndarray],
+    collector_update: Callable,
+    *,
     total_steps: int,
     thermalization_steps: int,
     thin_stride: int,
-    *,
     n_spin_orbitals: int,
     n_sites: int,
-    collector_init,
-    collector_update: Callable,
-    n_up: Optional[int] = None,
-    n_dn: Optional[int] = None,
-):
-    """Run Metropolis sampling while streaming results to a collector."""
-    thin_stride = max(thin_stride, 1)
+    spin_restricted: bool,
+) -> Callable[[Any, jax.Array, jnp.ndarray, Any], Tuple[jax.Array, jnp.ndarray, Any, jnp.ndarray]]:
+    """Build a jit-able streaming Metropolis kernel."""
     n_post = max(0, total_steps - thermalization_steps)
     record_flag = jnp.asarray(n_post > 0, dtype=jnp.bool_)
     therm = jnp.asarray(thermalization_steps, dtype=jnp.int32)
     stride = jnp.asarray(thin_stride, dtype=jnp.int32)
 
-    if n_up is None or n_dn is None:
+    if spin_restricted:
         def _propose(key_prop, electrons_state):
-            """Draw a single spinless candidate configuration."""
             _, proposal = _propose_move_spinless(
                 key_prop, electrons_state, n_spin_orbitals)
             return proposal
     else:
         def _propose(key_prop, electrons_state):
-            """Draw a candidate respecting spin populations."""
             _, proposal = _propose_move_spinful(
                 key_prop, electrons_state, n_sites)
             return proposal
 
-    def _run(key_state, electrons_state, collector_state):
-        """Advance the chain while updating the user collector."""
+    def _run(state, key_state, electrons_state, collector_state):
         electrons_state = jnp.asarray(electrons_state, dtype=jnp.int32)
-        logabs0, _ = psi.logabs_amplitude(electrons_state)
-        logabs_state = jnp.asarray(jnp.real(logabs0), dtype=jnp.float32)
+        logabs0 = jnp.asarray(
+            logabs_fn(state, electrons_state), dtype=jnp.float32)
 
         def _body(carry, step):
-            """Single Metropolis proposal/accept step."""
             key_c, electrons_c, logabs_c, acc_count_c, collector_c = carry
             key_c, move_key, acc_key = jax.random.split(key_c, 3)
             proposal = _propose(move_key, electrons_c)
-            new_logabs = psi.logabs_amplitude(proposal)[0]
-            new_logabs = jnp.asarray(jnp.real(new_logabs), dtype=jnp.float32)
+            new_logabs = jnp.asarray(
+                logabs_fn(state, proposal), dtype=jnp.float32)
 
             valid = jnp.isfinite(logabs_c) & jnp.isfinite(new_logabs)
             log_ratio = jnp.where(
@@ -311,23 +304,31 @@ def streaming_metropolis_chain(
             post_idx = step - therm
             take_sample = jnp.logical_and(
                 record_flag,
-                jnp.logical_and(step >= therm, jnp.equal(
-                    jnp.mod(post_idx, stride), 0)),
+                jnp.logical_and(
+                    step >= therm,
+                    jnp.equal(jnp.mod(post_idx, stride), 0),
+                ),
             )
 
             collector_next = jax.lax.cond(
                 take_sample,
-                lambda state: collector_update(state, electrons_next),
-                lambda state: state,
+                lambda state_in: collector_update(state_in, electrons_next),
+                lambda state_in: state_in,
                 collector_c,
             )
 
-            return (key_c, electrons_next, logabs_next, acc_count_next, collector_next), None
+            return (
+                key_c,
+                electrons_next,
+                logabs_next,
+                acc_count_next,
+                collector_next,
+            ), None
 
         init_carry = (
             key_state,
             electrons_state,
-            logabs_state,
+            logabs0,
             jnp.float32(0.0),
             collector_state,
         )
@@ -346,6 +347,78 @@ def streaming_metropolis_chain(
         )
         return key_f, electrons_f, collector_f, acceptance
 
-    run_fn = jax.jit(_run, static_argnames=())
+    # collector_update is closed over from the outer scope in streaming_metropolis_chain
+    return jax.jit(_run, static_argnames=())
+def streaming_metropolis_chain(
+    psi,
+    key: jax.Array,
+    initial_electrons: jnp.ndarray,
+    total_steps: int,
+    thermalization_steps: int,
+    thin_stride: int,
+    *,
+    n_spin_orbitals: int,
+    n_sites: int,
+    collector_init,
+    collector_update: Callable,
+    n_up: Optional[int] = None,
+    n_dn: Optional[int] = None,
+    logabs_state: Any = None,
+    logabs_fn: Optional[Callable[[Any, jnp.ndarray], jnp.ndarray]] = None,
+):
+    """Run Metropolis sampling while streaming results to a collector."""
+    thin_stride = max(thin_stride, 1)
+    spin_restricted = n_up is None or n_dn is None
+
+    if logabs_fn is None:
+        if isinstance(psi, NeuralWavefunction):
+            def _logabs_fn(params, electrons):
+                logabs, _ = evaluate_logabs_phase(
+                    psi.model, psi.num_slaters, params, electrons)
+                return jnp.asarray(jnp.real(logabs), dtype=jnp.float32)
+
+            logabs_fn = _logabs_fn
+            logabs_state = psi.params
+        else:
+            def _logabs_fn(_, electrons):
+                logabs, _ = psi.logabs_amplitude(electrons)
+                return jnp.asarray(jnp.real(logabs), dtype=jnp.float32)
+
+            logabs_fn = _logabs_fn
+            logabs_state = ()
+    elif logabs_state is None:
+        raise ValueError(
+            "logabs_state must be provided when logabs_fn is supplied")
+
+    cache_key = (
+        id(logabs_fn),
+        id(collector_update),
+        total_steps,
+        thermalization_steps,
+        thin_stride,
+        n_spin_orbitals,
+        n_sites,
+        spin_restricted,
+    )
+
+    kernel = _STREAMING_KERNEL_CACHE.get(cache_key)
+    if kernel is None:
+        kernel = _make_streaming_kernel(
+            logabs_fn,
+            collector_update,
+            total_steps=total_steps,
+            thermalization_steps=thermalization_steps,
+            thin_stride=thin_stride,
+            n_spin_orbitals=n_spin_orbitals,
+            n_sites=n_sites,
+            spin_restricted=spin_restricted,
+        )
+        _STREAMING_KERNEL_CACHE[cache_key] = kernel
+
     collector_init = jax.tree.map(lambda x: jnp.asarray(x), collector_init)
-    return run_fn(key, jnp.asarray(initial_electrons, dtype=jnp.int32), collector_init)
+    return kernel(
+        logabs_state,
+        key,
+        jnp.asarray(initial_electrons, dtype=jnp.int32),
+        collector_init,
+    )

@@ -16,6 +16,7 @@ from .hamiltonians import (
     kinetic_indices,
     local_energy_batch,
     local_energy,
+    local_energy_with_logfn,
 )
 from .neural import (
     NeuralWavefunction,
@@ -25,6 +26,7 @@ from .neural import (
     load_params,
     make_optimizer,
     save_params,
+    evaluate_logabs_phase,
 )
 from .optimizer import (
     make_kfac_optimizer,
@@ -493,77 +495,95 @@ def run_vmc_nqs(
             n_post + thin_stride - 1) // thin_stride
         max_energy_records = min(n_samples, 4096) if n_samples else 0
 
-        for opt_step in range(optimization_steps):
-            grad_fn = _make_grad_fn(wavefn)
-            grad_sample = grad_fn(wavefn.params, electrons[None, :])
-            grad_sample = tree_util.tree_map(lambda g: g[0], grad_sample)
-            sum_grad0 = tree_util.tree_map(
-                lambda g: jnp.zeros_like(g), grad_sample)
+        model = wavefn.model
+        num_slaters = wavefn.num_slaters
 
+        def neural_logabs_fn(params, electrons):
+            return evaluate_logabs_phase(model, num_slaters, params, electrons)
+
+        def sampler_logabs_fn(params, electrons):
+            logabs, _ = neural_logabs_fn(params, electrons)
+            return jnp.asarray(jnp.real(logabs), dtype=jnp.float32)
+
+        grad_fn = _make_grad_fn(wavefn)
+        grad_sample = grad_fn(wavefn.params, electrons[None, :])
+        grad_sample = tree_util.tree_map(lambda g: g[0], grad_sample)
+        sum_grad_template = tree_util.tree_map(
+            lambda g: jnp.zeros_like(g), grad_sample)
+
+        use_buffer = max_energy_records > 0
+
+        def collector_update(state, electrons_sample):
+            """Aggregate streaming energies and gradient moments."""
+            (count,
+             sum_e,
+             sum_e2,
+             buf,
+             ptr,
+             sum_grad,
+             sum_e_grad,
+             params_state,) = state
+
+            energy = jnp.asarray(
+                jnp.real(
+                    local_energy_with_logfn(
+                        ham,
+                        t_matrix,
+                        connections,
+                        neural_logabs_fn,
+                        params_state,
+                        electrons_sample,
+                    )
+                ),
+                dtype=jnp.float32,
+            )
+            count = count + jnp.int32(1)
+            sum_e = sum_e + energy
+            sum_e2 = sum_e2 + energy * energy
+
+            if use_buffer:
+                buf = jax.lax.cond(
+                    ptr < buf.shape[0],
+                    lambda b: b.at[ptr].set(energy),
+                    lambda b: b,
+                    buf,
+                )
+                ptr = jnp.minimum(ptr + 1, buf.shape[0])
+
+            grads = grad_fn(params_state, electrons_sample[jnp.newaxis, :])
+            grads = tree_util.tree_map(lambda g: g[0], grads)
+            sum_grad = tree_util.tree_map(
+                lambda acc, g: acc + g, sum_grad, grads)
+            sum_e_grad = tree_util.tree_map(
+                lambda acc, g: acc + energy * g, sum_e_grad, grads)
+
+            return (
+                count,
+                sum_e,
+                sum_e2,
+                buf,
+                ptr,
+                sum_grad,
+                sum_e_grad,
+                params_state,
+            )
+
+        for opt_step in range(optimization_steps):
+            energy_buffer = (
+                jnp.zeros((max_energy_records,), dtype=jnp.float32)
+                if use_buffer
+                else jnp.zeros((0,), dtype=jnp.float32)
+            )
             collector_init = (
                 jnp.int32(0),
                 jnp.float32(0.0),
                 jnp.float32(0.0),
-                jnp.zeros((max_energy_records,), dtype=jnp.float32),
+                energy_buffer,
                 jnp.int32(0),
-                sum_grad0,
-                sum_grad0,
+                sum_grad_template,
+                sum_grad_template,
+                wavefn.params,
             )
-
-            if max_energy_records > 0:
-
-                # type: ignore[no-redef]
-                def collector_update(state, electrons_sample):
-                    """Aggregate streaming energies and gradient moments."""
-                    count, sum_e, sum_e2, buf, ptr, sum_grad, sum_e_grad = state
-                    energy = jnp.asarray(
-                        jnp.real(local_energy(ham, t_matrix,
-                                 connections, wavefn, electrons_sample)),
-                        dtype=jnp.float32,
-                    )
-                    count = count + jnp.int32(1)
-                    sum_e = sum_e + energy
-                    sum_e2 = sum_e2 + energy * energy
-                    buf = jax.lax.cond(
-                        ptr < buf.shape[0],
-                        lambda b: b.at[ptr].set(energy),
-                        lambda b: b,
-                        buf,
-                    )
-                    ptr = jnp.minimum(ptr + 1, buf.shape[0])
-
-                    grads = grad_fn(
-                        wavefn.params, electrons_sample[jnp.newaxis, :])
-                    grads = tree_util.tree_map(lambda g: g[0], grads)
-                    sum_grad = tree_util.tree_map(
-                        lambda acc, g: acc + g, sum_grad, grads)
-                    sum_e_grad = tree_util.tree_map(
-                        lambda acc, g: acc + energy * g, sum_e_grad, grads)
-                    return (count, sum_e, sum_e2, buf, ptr, sum_grad, sum_e_grad)
-
-            else:
-
-                # type: ignore[no-redef]
-                def collector_update(state, electrons_sample):
-                    """Aggregate streaming energy and gradient moments (no buffer)."""
-                    count, sum_e, sum_e2, buf, ptr, sum_grad, sum_e_grad = state
-                    energy = jnp.asarray(
-                        jnp.real(local_energy(ham, t_matrix,
-                                 connections, wavefn, electrons_sample)),
-                        dtype=jnp.float32,
-                    )
-                    count = count + jnp.int32(1)
-                    sum_e = sum_e + energy
-                    sum_e2 = sum_e2 + energy * energy
-
-                    grads = grad_fn(
-                        wavefn.params, electrons_sample[jnp.newaxis, :])
-                    grads = tree_util.tree_map(lambda g: g[0], grads)
-                    sum_grad = tree_util.tree_map(
-                        lambda acc, g: acc + g, sum_grad, grads)
-                    sum_e_grad = tree_util.tree_map(
-                        lambda acc, g: acc + energy * g, sum_e_grad, grads)
-                    return (count, sum_e, sum_e2, buf, ptr, sum_grad, sum_e_grad)
 
             key, electrons, collector_state, acceptance = streaming_metropolis_chain(
                 wavefn,
@@ -576,29 +596,30 @@ def run_vmc_nqs(
                 n_sites=ham.n_sites,
                 collector_init=collector_init,
                 collector_update=collector_update,
+                logabs_state=wavefn.params,
+                logabs_fn=sampler_logabs_fn,
             )
 
             acceptance_rate = float(acceptance)
 
-            collector_state = jax.device_get(collector_state)
-            count = int(collector_state[0])
-            sum_e = float(collector_state[1])
-            sum_e2 = float(collector_state[2])
-            energy_buf = np.asarray(
-                collector_state[3]) if max_energy_records else np.array([])
-            energy_ptr = int(collector_state[4]) if max_energy_records else 0
+            count = int(collector_state[0].item())
+            sum_e_val = collector_state[1]
+            sum_e2_val = collector_state[2]
+            energy_buf = collector_state[3]
+            energy_ptr = int(collector_state[4].item())
             sum_grad_tree = collector_state[5]
             sum_e_grad_tree = collector_state[6]
 
-            if max_energy_records:
+            if use_buffer:
                 last_energies = energy_buf[:energy_ptr]
             else:
-                last_energies = np.array([])
+                last_energies = jnp.zeros((0,), dtype=jnp.float32)
 
             if count > 0:
-                avg_energy = sum_e / count
-                variance = max(sum_e2 / count - avg_energy ** 2, 0.0)
-                std_energy = float(np.sqrt(variance))
+                avg_energy = float(sum_e_val / count)
+                variance = float(
+                    sum_e2_val / count - (sum_e_val / count) ** 2)
+                std_energy = float(np.sqrt(max(variance, 0.0)))
             else:
                 avg_energy = 0.0
                 std_energy = 0.0
@@ -613,11 +634,8 @@ def run_vmc_nqs(
             )
 
             if count > 0:
-                sum_grad_tree = tree_util.tree_map(jnp.asarray, sum_grad_tree)
-                sum_e_grad_tree = tree_util.tree_map(
-                    jnp.asarray, sum_e_grad_tree)
                 count_f = jnp.asarray(count, dtype=jnp.float32)
-                avg_energy_j = jnp.asarray(avg_energy, dtype=jnp.float32)
+                avg_energy_j = sum_e_val / count_f
 
                 mean_grad = tree_util.tree_map(
                     lambda s: s / count_f, sum_grad_tree)

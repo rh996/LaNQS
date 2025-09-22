@@ -15,7 +15,7 @@ LaNQS (Lattice Neural Quantum States) is a JAX-based toolbox for variational Mon
    ```
 2. Install core dependencies.
    ```bash
-   pip install -U pip jax jaxlib flax optax numpy scipy tqdm
+   pip install -U pip jax flax optax numpy scipy kfac_jax
    ```
    For GPU/TPU support, follow the [official JAX installation guide](https://github.com/google/jax#pip-installation) to pick the wheel that matches your accelerator. Install `kfac_jax` if you plan to use the KFAC optimiser.
 

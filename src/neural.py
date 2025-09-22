@@ -15,6 +15,36 @@ from .utils import create_position_vectors
 from .wavefunctions import Wavefunction
 
 
+def evaluate_logabs_phase(
+    model: nn.Module,
+    num_slaters: int,
+    params: Any,
+    electrons: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Return (log|ψ|, phase) for a single configuration."""
+    electrons = jnp.asarray(electrons, dtype=jnp.int32)
+    if electrons.ndim == 1:
+        electrons = electrons[None, :]
+
+    matrices = model.apply(params, electrons)
+    if matrices.ndim == 4:
+        # (batch, num_slaters, nelec, nelec)
+        matrices = matrices[0]
+    else:
+        # SlaterNet produces (batch, nelec, nelec)
+        matrices = matrices[0:1]
+
+    det_fn = jax.vmap(jnp.linalg.slogdet, in_axes=0)
+    signs, logabs = det_fn(matrices)
+    max_log = jnp.max(logabs)
+    scaled = jnp.sum(signs * jnp.exp(logabs - max_log))
+    amp = jnp.exp(max_log) * scaled
+    abs_amp = jnp.abs(amp)
+    phase = jnp.where(abs_amp == 0, 0.0 + 0.0j, amp / abs_amp)
+    logabs_total = jnp.where(abs_amp == 0, -jnp.inf, jnp.log(abs_amp))
+    return logabs_total, phase
+
+
 class Encoder(nn.Module):
     Nx: int
     Ny: int
@@ -262,21 +292,8 @@ class NeuralWavefunction(Wavefunction):
         return self.logabs_amplitude_from_params(self.params, electrons)
 
     def logabs_amplitude_from_params(self, params: Any, electrons: jnp.ndarray):
-        electrons = electrons[None, :]
-        matrices = self.model.apply(params, electrons)
-        if matrices.ndim == 4:
-            matrices = matrices[0]
-        else:
-            matrices = matrices[0:1]
-        det_fn = jax.vmap(jnp.linalg.slogdet, in_axes=0)
-        signs, logabs = det_fn(matrices)
-        max_log = jnp.max(logabs)
-        scaled = jnp.sum(signs * jnp.exp(logabs - max_log))
-        amp = jnp.exp(max_log) * scaled
-        abs_amp = jnp.abs(amp)
-        phase = jnp.where(abs_amp == 0, 0.0 + 0.0j, amp / abs_amp)
-        logabs_total = jnp.where(abs_amp == 0, -jnp.inf, jnp.log(abs_amp))
-        return logabs_total, phase
+        return evaluate_logabs_phase(
+            self.model, self.num_slaters, params, electrons)
 
     def set_params(self, params: Any) -> None:
         self.params = params

@@ -178,3 +178,25 @@ def local_energy_batch_with_logfn(
             ham, t_matrix, connections, logabs_fn, cfg)
     )
     return vmap_energy(configs)
+
+
+def local_energy_with_logfn(
+    ham: HubbardHamiltonian,
+    t_matrix: jnp.ndarray,
+    connections: jnp.ndarray,
+    logabs_fn,
+    params,
+    electrons: jnp.ndarray,
+) -> jnp.ndarray:
+    """Local energy for a single configuration with parameterised log-amplitude."""
+
+    def _wrapped(electrons_cfg):
+        return logabs_fn(params, electrons_cfg)
+
+    return _local_energy_core(
+        ham,
+        t_matrix,
+        connections,
+        _wrapped,
+        electrons,
+    )
