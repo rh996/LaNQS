@@ -298,9 +298,6 @@ class NeuralWavefunction(Wavefunction):
     def set_params(self, params: Any) -> None:
         self.params = params
 
-    def state_dict(self) -> Any:
-        return self.params
-
 
 def save_params(params: Any, path: str | Path) -> None:
     """Serialize network parameters to disk."""

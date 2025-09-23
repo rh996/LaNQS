@@ -57,24 +57,12 @@ def _propose_move_spinless(
     candidate_pool = jnp.arange(n_spin_orbitals, dtype=jnp.int32)
     empty_mask = occ[candidate_pool] == 0
 
-    def _draw_candidate(draw_key):
-        draw_key, sample_key = jax.random.split(draw_key)
-        cand_idx = jax.random.randint(sample_key, (), 0, candidate_pool.shape[0])
-        return draw_key, candidate_pool[cand_idx]
-
     def _sample_move(draw_key):
-        draw_key, candidate = _draw_candidate(draw_key)
-
-        def _cond_fn(state):
-            _, cand = state
-            return occ[cand] == 1
-
-        def _body_fn(state):
-            state_key, _ = state
-            return _draw_candidate(state_key)
-
-        draw_key, candidate = jax.lax.while_loop(
-            _cond_fn, _body_fn, (draw_key, candidate))
+        # Sample uniformly from empty orbitals via Gumbel-max trick.
+        draw_key, gkey = jax.random.split(draw_key)
+        g = jax.random.gumbel(gkey, shape=candidate_pool.shape)
+        masked = jnp.where(empty_mask, g, -jnp.inf)
+        candidate = candidate_pool[jnp.argmax(masked)]
         new_electrons = electrons.at[idx].set(candidate)
         return draw_key, new_electrons
 
@@ -105,24 +93,12 @@ def _propose_move_spinful(
     occ = electron_occupancy(electrons, 2 * n_sites)
     empty_mask = occ[candidate_pool] == 0
 
-    def _draw_candidate(draw_key):
-        draw_key, sample_key = jax.random.split(draw_key)
-        cand_idx = jax.random.randint(sample_key, (), 0, candidate_pool.shape[0])
-        return draw_key, candidate_pool[cand_idx]
-
     def _sample_move(draw_key):
-        draw_key, candidate = _draw_candidate(draw_key)
-
-        def _cond_fn(state):
-            _, cand = state
-            return occ[cand] == 1
-
-        def _body_fn(state):
-            state_key, _ = state
-            return _draw_candidate(state_key)
-
-        draw_key, candidate = jax.lax.while_loop(
-            _cond_fn, _body_fn, (draw_key, candidate))
+        # Sample uniformly from empty spin-compatible orbitals via Gumbel-max.
+        draw_key, gkey = jax.random.split(draw_key)
+        g = jax.random.gumbel(gkey, shape=candidate_pool.shape)
+        masked = jnp.where(empty_mask, g, -jnp.inf)
+        candidate = candidate_pool[jnp.argmax(masked)]
         new_electrons = electrons.at[idx].set(candidate)
         return draw_key, new_electrons
 

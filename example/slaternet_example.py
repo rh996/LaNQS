@@ -21,8 +21,8 @@ def main() -> None:
         lr=1e-2,
         wf_type="slaternet",
         thin_stride=10,
-        optimizer_type="AdamW",
-        minibatch_size=512
+        optimizer_type="adamW",
+        minibatch_size=1024
     )
 
     print("SlaterNet example finished")

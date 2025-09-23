@@ -12,6 +12,14 @@ def _assert_vmc_result(result):
     assert 0.0 <= result.acceptance <= 1.0, "acceptance must be a probability"
     assert result.energies.ndim == 1, "energy history should be 1-D"
     assert result.energies.size > 0, "expect at least one recorded energy sample"
+    assert result.mean_history.ndim == 1, "mean history must be 1-D"
+    assert result.std_history.ndim == 1, "std history must be 1-D"
+    assert result.mean_history.size == result.std_history.size, "history lengths should match"
+    assert result.mean_history.size > 0, "expect at least one recorded mean"
+    assert np.all(np.isfinite(result.mean_history)), "mean history should be finite"
+    assert np.all(np.isfinite(result.std_history)), "std history should be finite"
+    assert np.isclose(result.mean_history[-1], result.avg_energy), "final mean should match avg_energy"
+    assert np.isclose(result.std_history[-1], result.std_energy), "final std should match std_energy"
 
 
 def test_slater_vmc_smoke():

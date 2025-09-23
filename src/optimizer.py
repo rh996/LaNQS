@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 from jax import tree_util
 from jax._src import ad_util
-import optax
 
 from .hamiltonians import local_energy_batch_with_logfn
 from .wavefunctions import Gutzwiller, JastrowLimited
@@ -133,29 +132,7 @@ def _tree_vdot(gradient_tree, tangent) -> jnp.ndarray:
     return jnp.sum(jnp.stack(dots))
 
 
-def optimize_neural(
-    wavefn: NeuralWavefunction,
-    optimizer: optax.GradientTransformation,
-    opt_state,
-    configs: jnp.ndarray,
-    local_energies: jnp.ndarray,
-    energy_ref: float,
-    theta: float = 5.0,
-):
-    """Apply an optax update using score-function statistics."""
-    if configs.shape[0] == 0:
-        return wavefn, opt_state
-
-    grad_fn = _make_grad_fn(wavefn)
-    deltas = _clip_energy_differences(local_energies, energy_ref, theta)
-    gradient_tree = _score_function_gradient(
-        grad_fn, wavefn.params, configs, deltas)
-
-    updates, opt_state = optimizer.update(
-        gradient_tree, opt_state, wavefn.params)
-    new_params = optax.apply_updates(wavefn.params, updates)
-    wavefn.set_params(new_params)
-    return wavefn, opt_state
+# Note: optimize_neural was unused and removed in favor of the adamw path in vmc.
 
 
 def make_kfac_optimizer(

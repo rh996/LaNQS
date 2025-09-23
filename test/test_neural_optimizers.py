@@ -13,6 +13,14 @@ def _assert_nqs_result(result):
     assert 0.0 <= result.acceptance <= 1.0, "acceptance must live in [0, 1]"
     assert result.energies.ndim == 1, "energies should be a 1-D array"
     assert result.energies.size > 0, "expect some recorded energy samples"
+    assert result.mean_history.ndim == 1, "mean history should be 1-D"
+    assert result.std_history.ndim == 1, "std history should be 1-D"
+    assert result.mean_history.size == result.std_history.size, "history lengths must match"
+    assert result.mean_history.size > 0, "expect recorded mean energies"
+    assert np.all(np.isfinite(result.mean_history)), "mean history must be finite"
+    assert np.all(np.isfinite(result.std_history)), "std history must be finite"
+    assert np.isclose(result.mean_history[-1], result.avg_energy), "final mean should equal avg_energy"
+    assert np.isclose(result.std_history[-1], result.std_energy), "final std should equal std_energy"
 
 
 def test_slaternet_adamw_optimizer():
