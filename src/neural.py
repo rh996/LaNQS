@@ -129,24 +129,7 @@ class SlaterNetModel(nn.Module):
         return x  # (batch, 1, nelec, nelec)
 
 
-class TransformerBlock(nn.Module):
-    emb_size: int
-    num_heads: int
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        y = nn.LayerNorm()(x)
-        attn = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
-            kernel_init=nn.initializers.kaiming_normal(),
-        )(y, y)
-        x = x + attn
-        ff = nn.Dense(
-            self.emb_size,
-            kernel_init=nn.initializers.kaiming_normal(),
-        )(jnp.tanh(x))
-        x = x + ff
-        return x
+## Note: Unified attention — standard TransformerBlock replaced by KFAC-friendly block.
 
 
 class FermiMultiHeadAttention(nn.Module):
@@ -230,44 +213,16 @@ class TransformerNetModel(nn.Module):
 
     @nn.compact
     def __call__(self, electrons: jnp.ndarray) -> jnp.ndarray:
-        x = Encoder(self.Nx, self.Ny)(electrons)
-        x = nn.Dense(
-            self.emb_size,
-            kernel_init=nn.initializers.kaiming_normal(),
-        )(x)
-        for _ in range(self.num_att_blocks):
-            x = TransformerBlock(self.emb_size, self.num_heads)(x)
-        x = nn.LayerNorm()(x)
-        x = nn.Dense(
-            self.nelec * self.num_slaters,
-            kernel_init=nn.initializers.kaiming_normal(),
-        )(x)
-        batch, nelec, _ = x.shape
-        x = x.reshape((batch, nelec, self.num_slaters, self.nelec))
-        x = jnp.transpose(x, (0, 2, 1, 3))
-        return x  # (batch, num_slaters, nelec, nelec)
-
-
-class TransformerNetKFACModel(nn.Module):
-    Nx: int
-    Ny: int
-    nelec: int
-    emb_size: int
-    num_heads: int
-    num_att_blocks: int
-    num_slaters: int
-
-    @nn.compact
-    def __call__(self, electrons: jnp.ndarray) -> jnp.ndarray:
-        """Forward pass with attention expressed via KFAC-compatible ops."""
+        """Unified Transformer using KFAC-friendly attention for all optimizers."""
         if self.emb_size % self.num_heads != 0:
             raise ValueError(
-                "emb_size must be divisible by num_heads for KFAC Transformer")
+                "emb_size must be divisible by num_heads for Transformer")
         x = Encoder(self.Nx, self.Ny)(electrons)
         x = nn.Dense(
             self.emb_size,
             kernel_init=nn.initializers.kaiming_normal(),
         )(x)
+        head_dim = self.emb_size // self.num_heads
         for _ in range(self.num_att_blocks):
             x = TransformerBlockKFAC(self.emb_size, self.num_heads)(x)
         x = nn.LayerNorm()(x)
@@ -279,6 +234,10 @@ class TransformerNetKFACModel(nn.Module):
         x = x.reshape((batch, nelec, self.num_slaters, self.nelec))
         x = jnp.transpose(x, (0, 2, 1, 3))
         return x  # (batch, num_slaters, nelec, nelec)
+
+
+## Note: TransformerNetKFACModel is no longer needed since TransformerNetModel
+## uses the KFAC-friendly attention for all optimizer choices.
 
 
 @dataclass

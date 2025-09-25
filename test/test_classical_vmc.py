@@ -10,8 +10,7 @@ def _assert_vmc_result(result):
     assert np.isfinite(result.avg_energy), "average energy should be finite"
     assert np.isfinite(result.std_energy), "energy std should be finite"
     assert 0.0 <= result.acceptance <= 1.0, "acceptance must be a probability"
-    assert result.energies.ndim == 1, "energy history should be 1-D"
-    assert result.energies.size > 0, "expect at least one recorded energy sample"
+    # Per-sample energy history is intentionally omitted to save memory.
     assert result.mean_history.ndim == 1, "mean history must be 1-D"
     assert result.std_history.ndim == 1, "std history must be 1-D"
     assert result.mean_history.size == result.std_history.size, "history lengths should match"

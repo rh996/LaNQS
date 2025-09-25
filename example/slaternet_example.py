@@ -11,9 +11,9 @@ def main() -> None:
         Ny=4,
         t_hopping=1.0,
         u_interaction=5.0,
-        nelec=16,
-        n_up=8,
-        n_dn=8,
+        nelec=4,
+        n_up=2,
+        n_dn=2,
         total_steps=11000,
         thermalization_steps=1000,
         optimization_steps=50,
@@ -21,8 +21,8 @@ def main() -> None:
         lr=1e-2,
         wf_type="slaternet",
         thin_stride=10,
-        optimizer_type="adamW",
-        minibatch_size=1024
+        optimizer_type="kfac",
+        minibatch_size=512,
     )
 
     print("SlaterNet example finished")

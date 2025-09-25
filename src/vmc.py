@@ -22,7 +22,6 @@ from .neural import (
     NeuralWavefunction,
     SlaterNetModel,
     TransformerNetModel,
-    TransformerNetKFACModel,
     load_params,
     make_optimizer,
     save_params,
@@ -53,7 +52,6 @@ class VMCResult:
     avg_energy: float
     std_energy: float
     acceptance: float
-    energies: np.ndarray
     mean_history: np.ndarray
     std_history: np.ndarray
 
@@ -100,7 +98,7 @@ def run_vmc(
     wf_type: str = "jastrow",
     seed: int = 1,
     lr: float = 1e-3,
-    thin_stride=5
+    thin_stride=5,
 ) -> VMCResult:
     """Optimize a classical Hubbard ansatz with streamed Metropolis sampling."""
     key = set_seed(seed)
@@ -117,7 +115,6 @@ def run_vmc(
     n_samples = 0 if n_post == 0 else (n_post + thin_stride - 1) // thin_stride
     max_energy_records = min(n_samples, 1024)
 
-    last_energies = np.array([])
     acceptance_rate = 0.0
     avg_energy_value = 0.0
     std_energy_value = 0.0
@@ -155,12 +152,14 @@ def run_vmc(
         )
 
         if estimator_size > 0:
+
             def collector_update(state, electrons_sample):
                 """Accumulate energy and estimator statistics for streaming."""
                 count, sum_e, sum_e2, buf, ptr, sum_est, sum_e_est = state
                 energy = jnp.asarray(
-                    jnp.real(local_energy(ham, t_matrix,
-                             connections, psi, electrons_sample)),
+                    jnp.real(
+                        local_energy(ham, t_matrix, connections, psi, electrons_sample)
+                    ),
                     dtype=jnp.float32,
                 )
                 count = count + jnp.int32(1)
@@ -173,23 +172,27 @@ def run_vmc(
                     buf,
                 )
                 ptr = jnp.minimum(ptr + 1, buf.shape[0])
-                est = jnp.asarray(psi.local_estimator(
-                    electrons_sample), dtype=jnp.float32).reshape((-1,))
+                est = jnp.asarray(
+                    psi.local_estimator(electrons_sample), dtype=jnp.float32
+                ).reshape((-1,))
                 sum_est = sum_est + est
                 sum_e_est = sum_e_est + energy * est
                 return (count, sum_e, sum_e2, buf, ptr, sum_est, sum_e_est)
+
             collector_update._cache_key = (
                 "classical_streaming_with_estimator",
                 psi.__class__.__name__,
                 estimator_size,
             )
         else:
+
             def collector_update(state, electrons_sample):
                 """Accumulate streamed energy moments for non-optimised ansätze."""
                 count, sum_e, sum_e2, buf, ptr, sum_est, sum_e_est = state
                 energy = jnp.asarray(
-                    jnp.real(local_energy(ham, t_matrix,
-                             connections, psi, electrons_sample)),
+                    jnp.real(
+                        local_energy(ham, t_matrix, connections, psi, electrons_sample)
+                    ),
                     dtype=jnp.float32,
                 )
                 count = count + jnp.int32(1)
@@ -203,6 +206,7 @@ def run_vmc(
                 )
                 ptr = jnp.minimum(ptr + 1, buf.shape[0])
                 return (count, sum_e, sum_e2, buf, ptr, sum_est, sum_e_est)
+
             collector_update._cache_key = (
                 "classical_streaming",
                 psi.__class__.__name__,
@@ -226,15 +230,11 @@ def run_vmc(
         count = int(collector_state[0])
         sum_e = float(collector_state[1])
         sum_e2 = float(collector_state[2])
-        energy_buf = np.asarray(collector_state[3])
-        energy_ptr = int(collector_state[4])
-        energy_records = energy_buf[:energy_ptr]
-
-        last_energies = energy_records
+        # Energy samples are buffered internally but not returned in results.
 
         if count > 0:
             avg_energy = sum_e / count
-            variance = max(sum_e2 / count - avg_energy ** 2, 0.0)
+            variance = max(sum_e2 / count - avg_energy**2, 0.0)
             std_energy = float(np.sqrt(variance))
         else:
             avg_energy = 0.0
@@ -246,7 +246,7 @@ def run_vmc(
         std_history.append(float(std_energy_value))
 
         print(
-            f"[Classical] Step {opt_step+1}/{optimization_steps} | "
+            f"[Classical] Step {opt_step + 1}/{optimization_steps} | "
             f"Energy = {avg_energy:.6f} ± {std_energy:.6f} | "
             f"Acceptance = {acceptance_rate:.3f}"
         )
@@ -264,17 +264,16 @@ def run_vmc(
             mean_e_est = (sum_e_est / denom).reshape(estimator_shape)
 
             if isinstance(psi, Gutzwiller):
-                psi = optimize_gutzwiller(
-                    psi, avg_energy, mean_est, mean_e_est, lr)
+                psi = optimize_gutzwiller(psi, avg_energy, mean_est, mean_e_est, lr)
             elif isinstance(psi, JastrowLimited):
                 psi = optimize_jastrow_limited(
-                    psi, avg_energy, mean_est, mean_e_est, lr)
+                    psi, avg_energy, mean_est, mean_e_est, lr
+                )
 
     return VMCResult(
         avg_energy=float(avg_energy_value),
         std_energy=float(std_energy_value),
         acceptance=acceptance_rate,
-        energies=last_energies,
         mean_history=np.asarray(mean_history, dtype=np.float32),
         std_history=np.asarray(std_history, dtype=np.float32),
     )
@@ -302,26 +301,16 @@ def _init_neural_wavefunction(
         params = model.init(key, sample)
         num_slaters = 1
     elif wf_type.lower() == "transformernet":
-        if kfac_safe:
-            model = TransformerNetKFACModel(
-                Nx=Nx,
-                Ny=Ny,
-                nelec=nelec,
-                emb_size=emb_size,
-                num_heads=num_heads,
-                num_att_blocks=num_att_blocks,
-                num_slaters=num_slaters,
-            )
-        else:
-            model = TransformerNetModel(
-                Nx=Nx,
-                Ny=Ny,
-                nelec=nelec,
-                emb_size=emb_size,
-                num_heads=num_heads,
-                num_att_blocks=num_att_blocks,
-                num_slaters=num_slaters,
-            )
+        # Unified TransformerNet uses KFAC-friendly attention for all optimizers.
+        model = TransformerNetModel(
+            Nx=Nx,
+            Ny=Ny,
+            nelec=nelec,
+            emb_size=emb_size,
+            num_heads=num_heads,
+            num_att_blocks=num_att_blocks,
+            num_slaters=num_slaters,
+        )
         params = model.init(key, sample)
     else:
         raise ValueError(f"Unknown neural wavefunction: {wf_type}")
@@ -368,8 +357,7 @@ def run_vmc_nqs(
 ) -> NQSResult:
     """Run neural VMC with either AdamW or KFAC optimisation."""
     if nelec is None and (n_up is None or n_dn is None):
-        raise ValueError(
-            "Provide either total nelec or spin-resolved n_up/n_dn")
+        raise ValueError("Provide either total nelec or spin-resolved n_up/n_dn")
 
     total_electrons = nelec if nelec is not None else (n_up + n_dn)
 
@@ -419,13 +407,10 @@ def run_vmc_nqs(
         opt_state = optimizer.init(wavefn.params)
 
     if nelec is not None:
-        key, electrons = initialize_configuration(
-            key, nelec, ham.n_spin_orbitals)
+        key, electrons = initialize_configuration(key, nelec, ham.n_spin_orbitals)
     else:
-        key, electrons = initialize_spin_configuration(
-            key, n_up, n_dn, ham.n_sites)
+        key, electrons = initialize_spin_configuration(key, n_up, n_dn, ham.n_sites)
 
-    last_energies = np.array([])
     acceptance_rate = 0.0
     avg_energy_value = 0.0
     std_energy_value = 0.0
@@ -433,8 +418,10 @@ def run_vmc_nqs(
     std_history: list[float] = []
 
     if optimizer_type == "kfac":
+
         def chain_fn(psi_state, n_up_state, n_dn_state):
             """Return a closure that runs the buffered Metropolis sampler."""
+
             def _chain(key_state, electrons_state):
                 """Run the buffered Metropolis sampler for KFAC."""
                 return metropolis_chain(
@@ -460,8 +447,7 @@ def run_vmc_nqs(
         # Reuse constant momentum across steps to avoid per-step allocations.
         momentum = jnp.asarray(0.0, dtype=kfac_lr.dtype)
         for opt_step in range(optimization_steps):
-            key, electrons, buffer, ptr, acceptance = chain_runner(
-                key, electrons)
+            key, electrons, buffer, ptr, acceptance = chain_runner(key, electrons)
             sample_count = int(ptr)
             samples = buffer[:sample_count]
             acceptance_rate = float(acceptance)
@@ -469,8 +455,7 @@ def run_vmc_nqs(
             if sample_count > 0:
                 if opt_state is None:
                     key, init_rng = jax.random.split(key)
-                    opt_state = kfac_optimizer.init(
-                        wavefn.params, init_rng, samples)
+                    opt_state = kfac_optimizer.init(wavefn.params, init_rng, samples)
                 key, opt_rng = jax.random.split(key)
                 step_out = kfac_optimizer.step(
                     params=wavefn.params,
@@ -494,61 +479,53 @@ def run_vmc_nqs(
                 # Use KFAC-provided loss/aux to avoid recomputation and host copies.
                 if stats is not None:
                     # Mean energy
-                    if isinstance(stats, dict) and 'loss' in stats:
-                        avg_energy_value = float(np.asarray(stats['loss']))
+                    if isinstance(stats, dict) and "loss" in stats:
+                        avg_energy_value = float(np.asarray(stats["loss"]))
                     else:
                         avg_energy_value = avg_energy_value  # keep previous if absent
                     # Per-sample energies for std and limited recording
                     energies_dev = None
-                    if isinstance(stats, dict) and 'aux' in stats and isinstance(stats['aux'], dict):
-                        energies_dev = stats['aux'].get('energies', None)
+                    if (
+                        isinstance(stats, dict)
+                        and "aux" in stats
+                        and isinstance(stats["aux"], dict)
+                    ):
+                        energies_dev = stats["aux"].get("energies", None)
                     if energies_dev is not None:
-                        std_energy_value = float(jax.device_get(jnp.std(jnp.real(energies_dev))))
-                        # Cap host energy copies to a reasonable size
-                        kfac_max_records = int(min(int(energies_dev.shape[0]), 1024))
-                        if kfac_max_records > 0:
-                            last_energies = np.asarray(
-                                jax.device_get(jnp.real(energies_dev[:kfac_max_records]))
-                            )
-                        else:
-                            last_energies = np.array([])
+                        std_energy_value = float(
+                            jax.device_get(jnp.std(jnp.real(energies_dev)))
+                        )
                     else:
                         # Fall back: compute std on device from samples if aux missing
                         energies_fallback = local_energy_batch(
-                            ham, t_matrix, connections, wavefn, samples)
-                        std_energy_value = float(jnp.std(jnp.real(energies_fallback)).item())
-                        kfac_max_records = int(min(int(energies_fallback.shape[0]), 1024))
-                        last_energies = np.asarray(
-                            jax.device_get(jnp.real(energies_fallback[:kfac_max_records]))
+                            ham, t_matrix, connections, wavefn, samples
+                        )
+                        std_energy_value = float(
+                            jnp.std(jnp.real(energies_fallback)).item()
                         )
                 else:
                     # No stats returned: compute mean/std from samples (previous behavior)
                     energies = local_energy_batch(
-                        ham, t_matrix, connections, wavefn, samples)
+                        ham, t_matrix, connections, wavefn, samples
+                    )
                     avg_energy_value = float(jnp.mean(jnp.real(energies)).item())
                     std_energy_value = float(jnp.std(jnp.real(energies)).item())
-                    kfac_max_records = int(min(int(energies.shape[0]), 1024))
-                    last_energies = np.asarray(
-                        jax.device_get(jnp.real(energies[:kfac_max_records]))
-                    )
             else:
                 avg_energy_value = 0.0
                 std_energy_value = 0.0
-                last_energies = np.array([])
 
             # Log and record histories once per step.
             mean_history.append(float(avg_energy_value))
             std_history.append(float(std_energy_value))
             print(
-                f"[Neural] Step {opt_step+1}/{optimization_steps} | "
+                f"[Neural] Step {opt_step + 1}/{optimization_steps} | "
                 f"Energy = {avg_energy_value:.6f} ± {std_energy_value:.6f} | "
                 f"Acceptance = {acceptance_rate:.3f}"
             )
     else:
         n_post = max(0, total_steps - thermalization_steps)
-        n_samples = 0 if n_post == 0 else (
-            n_post + thin_stride - 1) // thin_stride
-        max_energy_records = min(n_samples, 1024) if n_samples else 0
+        n_samples = 0 if n_post == 0 else (n_post + thin_stride - 1) // thin_stride
+
         grad_fn = _make_grad_fn(wavefn)
 
         def _make_adamw_step(batch_size: int, max_chunks: int):
@@ -567,11 +544,15 @@ def run_vmc_nqs(
                 )
                 fill = jnp.tile(last_cfg[None, :], (cap_len, 1))
                 idx = jnp.arange(cap_len)
-                samples_ext = jnp.where((idx[:, None] >= sample_count), fill, samples_ext)
+                samples_ext = jnp.where(
+                    (idx[:, None] >= sample_count), fill, samples_ext
+                )
 
                 # Initialize accumulators on device.
                 sum_grad_tree = tree_util.tree_map(lambda p: jnp.zeros_like(p), params)
-                sum_e_grad_tree = tree_util.tree_map(lambda p: jnp.zeros_like(p), params)
+                sum_e_grad_tree = tree_util.tree_map(
+                    lambda p: jnp.zeros_like(p), params
+                )
                 sum_e = jnp.float32(0.0)
                 sum_e2 = jnp.float32(0.0)
 
@@ -586,11 +567,14 @@ def run_vmc_nqs(
                         return wavefn.logabs_amplitude_from_params(params, cfg)
 
                     energies = local_energy_batch_with_logfn(
-                        ham, t_matrix, connections, _logabs_fn_cfg, cfg_chunk)
+                        ham, t_matrix, connections, _logabs_fn_cfg, cfg_chunk
+                    )
                     energies_real = jnp.asarray(jnp.real(energies), dtype=jnp.float32)
                     grads = grad_fn(params, cfg_chunk)
 
-                    w = ((jnp.arange(batch_size) + start) < sample_count).astype(jnp.float32)
+                    w = ((jnp.arange(batch_size) + start) < sample_count).astype(
+                        jnp.float32
+                    )
                     se = se + jnp.sum(w * energies_real)
                     se2 = se2 + jnp.sum(w * energies_real * energies_real)
 
@@ -665,43 +649,31 @@ def run_vmc_nqs(
                 max_chunks = (n_samples + batch_size - 1) // batch_size
 
                 if adamw_step is None or (
-                    getattr(adamw_step, "_batch_size", None) != batch_size or
-                    getattr(adamw_step, "_max_chunks", None) != max_chunks
+                    getattr(adamw_step, "_batch_size", None) != batch_size
+                    or getattr(adamw_step, "_max_chunks", None) != max_chunks
                 ):
                     adamw_step = _make_adamw_step(batch_size, max_chunks)
                     adamw_step._batch_size = batch_size
                     adamw_step._max_chunks = max_chunks
 
                 new_params, opt_state, avg_energy_j, std_energy_j = adamw_step(
-                    params, opt_state, samples, jnp.asarray(sample_count, dtype=jnp.int32))
+                    params,
+                    opt_state,
+                    samples,
+                    jnp.asarray(sample_count, dtype=jnp.int32),
+                )
                 wavefn.set_params(new_params)
 
                 avg_energy_value = float(jax.device_get(avg_energy_j))
                 std_energy_value = float(jax.device_get(std_energy_j))
 
-                # Optionally record a capped subset of energies for the result (host side).
-                energy_records: list[float] = []
-                if max_energy_records and sample_count > 0:
-                    def _logabs_fn_cfg(cfg):
-                        return wavefn.logabs_amplitude_from_params(params, cfg)
-                    subset = local_energy_batch_with_logfn(
-                        ham,
-                        t_matrix,
-                        connections,
-                        _logabs_fn_cfg,
-                        samples[:max_energy_records],
-                    )
-                    energy_records = np.asarray(
-                        jax.device_get(jnp.real(subset)), dtype=np.float32
-                    ).tolist()
-                last_energies = np.asarray(energy_records, dtype=np.float32)
+                # Omit per-sample energy recording in results to save memory.
             else:
                 avg_energy_value = 0.0
                 std_energy_value = 0.0
-                last_energies = np.array([])
 
             print(
-                f"[Neural] Step {opt_step+1}/{optimization_steps} | "
+                f"[Neural] Step {opt_step + 1}/{optimization_steps} | "
                 f"Energy = {avg_energy_value:.6f} ± {std_energy_value:.6f} | "
                 f"Acceptance = {acceptance_rate:.3f}"
             )
@@ -715,7 +687,6 @@ def run_vmc_nqs(
         avg_energy=float(avg_energy_value),
         std_energy=float(std_energy_value),
         acceptance=acceptance_rate,
-        energies=np.asarray(last_energies).real,
         mean_history=np.asarray(mean_history, dtype=np.float32),
         std_history=np.asarray(std_history, dtype=np.float32),
         params_path=str(param_path) if param_path else None,

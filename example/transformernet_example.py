@@ -9,12 +9,12 @@ def main() -> None:
         Ny=6,
         t_hopping=1.0,
         u_interaction=5.0,
-        nelec=20,
-        n_up=10,
-        n_dn=10,
-        total_steps=3000,
+        nelec=6,
+        n_up=3,
+        n_dn=3,
+        total_steps=6000,
         thermalization_steps=1000,
-        optimization_steps=150,
+        optimization_steps=50,
         seed=2,
         lr=1e-2,
         wf_type="transformernet",
@@ -23,8 +23,8 @@ def main() -> None:
         num_heads=3,
         num_slaters=4,
         emb_size=24,
-        optimizer_type="adamw",
-        minibatch_size=512
+        optimizer_type="kfac",
+        minibatch_size=1,
     )
 
     print("TransformerNet example finished")
