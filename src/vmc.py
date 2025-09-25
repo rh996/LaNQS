@@ -326,6 +326,304 @@ class NQSResult(VMCResult):
     params_path: Optional[str] = None
 
 
+def _prepare_electrons(
+    key: jax.Array,
+    nelec: Optional[int],
+    n_up: Optional[int],
+    n_dn: Optional[int],
+    ham: HubbardHamiltonian,
+):
+    if nelec is not None:
+        return initialize_configuration(key, nelec, ham.n_spin_orbitals)
+    return initialize_spin_configuration(key, n_up, n_dn, ham.n_sites)
+
+
+def _log_and_record(
+    step: int,
+    total_steps: int,
+    avg_energy_value: float,
+    std_energy_value: float,
+    acceptance_rate: float,
+    mean_history: list[float],
+    std_history: list[float],
+):
+    print(
+        f"[Neural] Step {step}/{total_steps} | "
+        f"Energy = {avg_energy_value:.6f} ± {std_energy_value:.6f} | "
+        f"Acceptance = {acceptance_rate:.3f}"
+    )
+    mean_history.append(float(avg_energy_value))
+    std_history.append(float(std_energy_value))
+
+
+def _kfac_training_loop(
+    wavefn: NeuralWavefunction,
+    ham: HubbardHamiltonian,
+    t_matrix: jnp.ndarray,
+    connections: jnp.ndarray,
+    *,
+    total_steps: int,
+    thermalization_steps: int,
+    thin_stride: int,
+    optimization_steps: int,
+    key: jax.Array,
+    electrons: jnp.ndarray,
+    nelec: Optional[int],
+    n_up: Optional[int],
+    n_dn: Optional[int],
+    kfac_optimizer,
+    kfac_lr: jnp.ndarray,
+    kfac_damping_arr: jnp.ndarray,
+):
+    # Build sampler runner with fixed psi/state signature
+    def chain_fn(psi_state, n_up_state, n_dn_state):
+        def _chain(key_state, electrons_state):
+            return metropolis_chain(
+                psi_state,
+                key_state,
+                electrons_state,
+                total_steps,
+                thermalization_steps,
+                thin_stride,
+                n_spin_orbitals=ham.n_spin_orbitals,
+                n_sites=ham.n_sites,
+                n_up=n_up_state,
+                n_dn=n_dn_state,
+            )
+
+        return _chain
+
+    chain_runner = (
+        chain_fn(wavefn, None, None) if nelec is not None else chain_fn(wavefn, n_up, n_dn)
+    )
+
+    momentum = jnp.asarray(0.0, dtype=kfac_lr.dtype)
+    opt_state = None
+    acceptance_rate = 0.0
+    avg_energy_value = 0.0
+    std_energy_value = 0.0
+    mean_history: list[float] = []
+    std_history: list[float] = []
+
+    for i in range(optimization_steps):
+        key, electrons, buffer, ptr, acceptance = chain_runner(key, electrons)
+        sample_count = int(ptr)
+        samples = buffer[:sample_count]
+        acceptance_rate = float(acceptance)
+
+        if sample_count > 0:
+            if opt_state is None:
+                key, init_rng = jax.random.split(key)
+                opt_state = kfac_optimizer.init(wavefn.params, init_rng, samples)
+            key, opt_rng = jax.random.split(key)
+            step_out = kfac_optimizer.step(
+                params=wavefn.params,
+                state=opt_state,
+                rng=opt_rng,
+                batch=samples,
+                learning_rate=kfac_lr,
+                momentum=momentum,
+                damping=kfac_damping_arr,
+            )
+
+            stats = None
+            if len(step_out) == 3:
+                new_params, opt_state, stats = step_out
+            elif len(step_out) >= 4:
+                new_params, opt_state, stats, _ = step_out[:4]
+            else:
+                new_params, opt_state = step_out[:2]
+            wavefn.set_params(new_params)
+
+            if stats is not None and isinstance(stats, dict):
+                if "loss" in stats:
+                    avg_energy_value = float(np.asarray(stats["loss"]))
+                energies_dev = None
+                if isinstance(stats.get("aux"), dict):
+                    energies_dev = stats["aux"].get("energies")
+                if energies_dev is not None:
+                    std_energy_value = float(jax.device_get(jnp.std(jnp.real(energies_dev))))
+                else:
+                    energies_fallback = local_energy_batch(ham, t_matrix, connections, wavefn, samples)
+                    std_energy_value = float(jnp.std(jnp.real(energies_fallback)).item())
+            else:
+                energies = local_energy_batch(ham, t_matrix, connections, wavefn, samples)
+                avg_energy_value = float(jnp.mean(jnp.real(energies)).item())
+                std_energy_value = float(jnp.std(jnp.real(energies)).item())
+        else:
+            avg_energy_value = 0.0
+            std_energy_value = 0.0
+
+        _log_and_record(i + 1, optimization_steps, avg_energy_value, std_energy_value, acceptance_rate, mean_history, std_history)
+
+    return (
+        avg_energy_value,
+        std_energy_value,
+        acceptance_rate,
+        mean_history,
+        std_history,
+        key,
+        electrons,
+    )
+
+
+def _make_adamw_step(
+    wavefn: NeuralWavefunction,
+    ham: HubbardHamiltonian,
+    t_matrix: jnp.ndarray,
+    connections: jnp.ndarray,
+    grad_fn,
+    optimizer,
+    batch_size: int,
+    max_chunks: int,
+):
+    @jax.jit
+    def _step_fn(params, opt_state, samples, sample_count):
+        nelec = samples.shape[1]
+        cap_len = max_chunks * batch_size
+        samples_ext = jnp.zeros((cap_len, nelec), dtype=jnp.int32)
+        samples_ext = jax.lax.dynamic_update_slice(samples_ext, samples, (0, 0))
+        last_cfg = jax.lax.cond(
+            sample_count > 0,
+            lambda _: samples[jnp.maximum(sample_count - 1, 0)],
+            lambda _: jnp.zeros((nelec,), dtype=jnp.int32),
+            operand=None,
+        )
+        fill = jnp.tile(last_cfg[None, :], (cap_len, 1))
+        idx = jnp.arange(cap_len)
+        samples_ext = jnp.where((idx[:, None] >= sample_count), fill, samples_ext)
+
+        sum_grad_tree = tree_util.tree_map(lambda p: jnp.zeros_like(p), params)
+        sum_e_grad_tree = tree_util.tree_map(lambda p: jnp.zeros_like(p), params)
+        sum_e = jnp.float32(0.0)
+        sum_e2 = jnp.float32(0.0)
+
+        def _scan_step(carry, i):
+            se, se2, sg, seg = carry
+            start = i * batch_size
+            cfg_chunk = jax.lax.dynamic_slice(samples_ext, (start, 0), (batch_size, nelec))
+
+            def _logabs_fn_cfg(cfg):
+                return wavefn.logabs_amplitude_from_params(params, cfg)
+
+            energies = local_energy_batch_with_logfn(ham, t_matrix, connections, _logabs_fn_cfg, cfg_chunk)
+            energies_real = jnp.asarray(jnp.real(energies), dtype=jnp.float32)
+            grads = grad_fn(params, cfg_chunk)
+
+            w = ((jnp.arange(batch_size) + start) < sample_count).astype(jnp.float32)
+            se = se + jnp.sum(w * energies_real)
+            se2 = se2 + jnp.sum(w * energies_real * energies_real)
+
+            def _wsum(g):
+                return jnp.tensordot(w, g, axes=([0], [0]))
+
+            def _wesum(g):
+                return jnp.tensordot(w * energies_real, g, axes=([0], [0]))
+
+            sg = tree_util.tree_map(lambda acc, g: acc + _wsum(g), sg, grads)
+            seg = tree_util.tree_map(lambda acc, g: acc + _wesum(g), seg, grads)
+
+            return (se, se2, sg, seg), None
+
+        (sum_e, sum_e2, sum_grad_tree, sum_e_grad_tree), _ = jax.lax.scan(
+            _scan_step, (sum_e, sum_e2, sum_grad_tree, sum_e_grad_tree), jnp.arange(max_chunks)
+        )
+
+        count_f = jnp.asarray(sample_count, dtype=jnp.float32)
+        avg_energy = sum_e / count_f
+        mean_grad = tree_util.tree_map(lambda s: s / count_f, sum_grad_tree)
+        mean_e_grad = tree_util.tree_map(lambda s: s / count_f, sum_e_grad_tree)
+        gradient_tree = tree_util.tree_map(lambda eg, g: 2.0 * (eg - avg_energy * g), mean_e_grad, mean_grad)
+
+        updates, opt_state = optimizer.update(gradient_tree, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        variance = sum_e2 / count_f - avg_energy * avg_energy
+        std_energy = jnp.sqrt(jnp.maximum(variance, 0.0))
+        return new_params, opt_state, avg_energy, std_energy
+
+    return _step_fn
+
+
+def _adamw_training_loop(
+    wavefn: NeuralWavefunction,
+    ham: HubbardHamiltonian,
+    t_matrix: jnp.ndarray,
+    connections: jnp.ndarray,
+    *,
+    total_steps: int,
+    thermalization_steps: int,
+    thin_stride: int,
+    optimization_steps: int,
+    key: jax.Array,
+    electrons: jnp.ndarray,
+    nelec: Optional[int],
+    n_up: Optional[int],
+    n_dn: Optional[int],
+    optimizer,
+    opt_state,
+    minibatch_size: Optional[int],
+):
+    n_post = max(0, total_steps - thermalization_steps)
+    n_samples = 0 if n_post == 0 else (n_post + thin_stride - 1) // thin_stride
+    grad_fn = _make_grad_fn(wavefn)
+
+    # Build step for chosen batch size and chunk count.
+    adamw_step = None
+    acceptance_rate = 0.0
+    avg_energy_value = 0.0
+    std_energy_value = 0.0
+    mean_history: list[float] = []
+    std_history: list[float] = []
+
+    # Common sampler kwargs
+    chain_kwargs = dict(n_spin_orbitals=ham.n_spin_orbitals, n_sites=ham.n_sites)
+    if nelec is None:
+        chain_kwargs.update(n_up=n_up, n_dn=n_dn)
+
+    for i in range(optimization_steps):
+        params = wavefn.params
+        key, electrons, buffer, ptr, acceptance = metropolis_chain(
+            wavefn, key, electrons, total_steps, thermalization_steps, thin_stride, **chain_kwargs
+        )
+        sample_count = int(ptr)
+        samples = buffer[:sample_count]
+        acceptance_rate = float(acceptance)
+
+        if sample_count > 0:
+            if minibatch_size is None or minibatch_size <= 0:
+                batch_size = max(1, n_samples)
+            else:
+                batch_size = minibatch_size
+            max_chunks = (n_samples + batch_size - 1) // batch_size
+            if adamw_step is None or getattr(adamw_step, "_sig", None) != (batch_size, max_chunks):
+                adamw_step = _make_adamw_step(wavefn, ham, t_matrix, connections, grad_fn, optimizer, batch_size, max_chunks)
+                adamw_step._sig = (batch_size, max_chunks)
+
+            new_params, opt_state, avg_energy_j, std_energy_j = adamw_step(
+                params, opt_state, samples, jnp.asarray(sample_count, dtype=jnp.int32)
+            )
+            wavefn.set_params(new_params)
+            avg_energy_value = float(jax.device_get(avg_energy_j))
+            std_energy_value = float(jax.device_get(std_energy_j))
+        else:
+            avg_energy_value = 0.0
+            std_energy_value = 0.0
+
+        _log_and_record(i + 1, optimization_steps, avg_energy_value, std_energy_value, acceptance_rate, mean_history, std_history)
+
+    return (
+        avg_energy_value,
+        std_energy_value,
+        acceptance_rate,
+        mean_history,
+        std_history,
+        key,
+        electrons,
+        opt_state,
+    )
+
+
 def run_vmc_nqs(
     Nx: int,
     Ny: int,
@@ -406,279 +704,64 @@ def run_vmc_nqs(
         optimizer = make_optimizer(lr)
         opt_state = optimizer.init(wavefn.params)
 
-    if nelec is not None:
-        key, electrons = initialize_configuration(key, nelec, ham.n_spin_orbitals)
-    else:
-        key, electrons = initialize_spin_configuration(key, n_up, n_dn, ham.n_sites)
-
-    acceptance_rate = 0.0
-    avg_energy_value = 0.0
-    std_energy_value = 0.0
-    mean_history: list[float] = []
-    std_history: list[float] = []
+    # Prepare initial electrons and dispatch to strategy-specific training loop.
+    key, electrons = _prepare_electrons(key, nelec, n_up, n_dn, ham)
 
     if optimizer_type == "kfac":
-
-        def chain_fn(psi_state, n_up_state, n_dn_state):
-            """Return a closure that runs the buffered Metropolis sampler."""
-
-            def _chain(key_state, electrons_state):
-                """Run the buffered Metropolis sampler for KFAC."""
-                return metropolis_chain(
-                    psi_state,
-                    key_state,
-                    electrons_state,
-                    total_steps,
-                    thermalization_steps,
-                    thin_stride,
-                    n_spin_orbitals=ham.n_spin_orbitals,
-                    n_sites=ham.n_sites,
-                    n_up=n_up_state,
-                    n_dn=n_dn_state,
-                )
-
-            return _chain
-
-        if nelec is not None:
-            chain_runner = chain_fn(wavefn, None, None)
-        else:
-            chain_runner = chain_fn(wavefn, n_up, n_dn)
-
-        # Reuse constant momentum across steps to avoid per-step allocations.
-        momentum = jnp.asarray(0.0, dtype=kfac_lr.dtype)
-        for opt_step in range(optimization_steps):
-            key, electrons, buffer, ptr, acceptance = chain_runner(key, electrons)
-            sample_count = int(ptr)
-            samples = buffer[:sample_count]
-            acceptance_rate = float(acceptance)
-
-            if sample_count > 0:
-                if opt_state is None:
-                    key, init_rng = jax.random.split(key)
-                    opt_state = kfac_optimizer.init(wavefn.params, init_rng, samples)
-                key, opt_rng = jax.random.split(key)
-                step_out = kfac_optimizer.step(
-                    params=wavefn.params,
-                    state=opt_state,
-                    rng=opt_rng,
-                    batch=samples,
-                    learning_rate=kfac_lr,
-                    momentum=momentum,
-                    damping=kfac_damping_arr,
-                )
-                # Extract stats from KFAC step if available for logging,
-                # falling back to explicit energy computation otherwise.
-                stats = None
-                if len(step_out) == 3:
-                    new_params, opt_state, stats = step_out
-                elif len(step_out) >= 4:
-                    new_params, opt_state, stats, _ = step_out[:4]
-                else:
-                    new_params, opt_state = step_out[:2]
-                wavefn.set_params(new_params)
-                # Use KFAC-provided loss/aux to avoid recomputation and host copies.
-                if stats is not None:
-                    # Mean energy
-                    if isinstance(stats, dict) and "loss" in stats:
-                        avg_energy_value = float(np.asarray(stats["loss"]))
-                    else:
-                        avg_energy_value = avg_energy_value  # keep previous if absent
-                    # Per-sample energies for std and limited recording
-                    energies_dev = None
-                    if (
-                        isinstance(stats, dict)
-                        and "aux" in stats
-                        and isinstance(stats["aux"], dict)
-                    ):
-                        energies_dev = stats["aux"].get("energies", None)
-                    if energies_dev is not None:
-                        std_energy_value = float(
-                            jax.device_get(jnp.std(jnp.real(energies_dev)))
-                        )
-                    else:
-                        # Fall back: compute std on device from samples if aux missing
-                        energies_fallback = local_energy_batch(
-                            ham, t_matrix, connections, wavefn, samples
-                        )
-                        std_energy_value = float(
-                            jnp.std(jnp.real(energies_fallback)).item()
-                        )
-                else:
-                    # No stats returned: compute mean/std from samples (previous behavior)
-                    energies = local_energy_batch(
-                        ham, t_matrix, connections, wavefn, samples
-                    )
-                    avg_energy_value = float(jnp.mean(jnp.real(energies)).item())
-                    std_energy_value = float(jnp.std(jnp.real(energies)).item())
-            else:
-                avg_energy_value = 0.0
-                std_energy_value = 0.0
-
-            # Log and record histories once per step.
-            mean_history.append(float(avg_energy_value))
-            std_history.append(float(std_energy_value))
-            print(
-                f"[Neural] Step {opt_step + 1}/{optimization_steps} | "
-                f"Energy = {avg_energy_value:.6f} ± {std_energy_value:.6f} | "
-                f"Acceptance = {acceptance_rate:.3f}"
-            )
+        (
+            avg_energy_value,
+            std_energy_value,
+            acceptance_rate,
+            mean_history,
+            std_history,
+            key,
+            electrons,
+        ) = _kfac_training_loop(
+            wavefn,
+            ham,
+            t_matrix,
+            connections,
+            total_steps=total_steps,
+            thermalization_steps=thermalization_steps,
+            thin_stride=thin_stride,
+            optimization_steps=optimization_steps,
+            key=key,
+            electrons=electrons,
+            nelec=nelec,
+            n_up=n_up,
+            n_dn=n_dn,
+            kfac_optimizer=kfac_optimizer,
+            kfac_lr=kfac_lr,
+            kfac_damping_arr=kfac_damping_arr,
+        )
     else:
-        n_post = max(0, total_steps - thermalization_steps)
-        n_samples = 0 if n_post == 0 else (n_post + thin_stride - 1) // thin_stride
-
-        grad_fn = _make_grad_fn(wavefn)
-
-        def _make_adamw_step(batch_size: int, max_chunks: int):
-            @jax.jit
-            def _step_fn(params, opt_state, samples, sample_count):
-                # Prepare extended samples buffer of static length cap_len.
-                nelec = samples.shape[1]
-                cap_len = max_chunks * batch_size
-                samples_ext = jnp.zeros((cap_len, nelec), dtype=jnp.int32)
-                samples_ext = jax.lax.dynamic_update_slice(samples_ext, samples, (0, 0))
-                last_cfg = jax.lax.cond(
-                    sample_count > 0,
-                    lambda _: samples[jnp.maximum(sample_count - 1, 0)],
-                    lambda _: jnp.zeros((nelec,), dtype=jnp.int32),
-                    operand=None,
-                )
-                fill = jnp.tile(last_cfg[None, :], (cap_len, 1))
-                idx = jnp.arange(cap_len)
-                samples_ext = jnp.where(
-                    (idx[:, None] >= sample_count), fill, samples_ext
-                )
-
-                # Initialize accumulators on device.
-                sum_grad_tree = tree_util.tree_map(lambda p: jnp.zeros_like(p), params)
-                sum_e_grad_tree = tree_util.tree_map(
-                    lambda p: jnp.zeros_like(p), params
-                )
-                sum_e = jnp.float32(0.0)
-                sum_e2 = jnp.float32(0.0)
-
-                def _scan_step(carry, i):
-                    se, se2, sg, seg = carry
-                    start = i * batch_size
-                    cfg_chunk = jax.lax.dynamic_slice(
-                        samples_ext, (start, 0), (batch_size, nelec)
-                    )
-
-                    def _logabs_fn_cfg(cfg):
-                        return wavefn.logabs_amplitude_from_params(params, cfg)
-
-                    energies = local_energy_batch_with_logfn(
-                        ham, t_matrix, connections, _logabs_fn_cfg, cfg_chunk
-                    )
-                    energies_real = jnp.asarray(jnp.real(energies), dtype=jnp.float32)
-                    grads = grad_fn(params, cfg_chunk)
-
-                    w = ((jnp.arange(batch_size) + start) < sample_count).astype(
-                        jnp.float32
-                    )
-                    se = se + jnp.sum(w * energies_real)
-                    se2 = se2 + jnp.sum(w * energies_real * energies_real)
-
-                    def _wsum(g):
-                        return jnp.tensordot(w, g, axes=([0], [0]))
-
-                    def _wesum(g):
-                        return jnp.tensordot(w * energies_real, g, axes=([0], [0]))
-
-                    sg = tree_util.tree_map(lambda acc, g: acc + _wsum(g), sg, grads)
-                    seg = tree_util.tree_map(lambda acc, g: acc + _wesum(g), seg, grads)
-
-                    return (se, se2, sg, seg), None
-
-                (sum_e, sum_e2, sum_grad_tree, sum_e_grad_tree), _ = jax.lax.scan(
-                    _scan_step,
-                    (sum_e, sum_e2, sum_grad_tree, sum_e_grad_tree),
-                    jnp.arange(max_chunks),
-                )
-
-                count_f = jnp.asarray(sample_count, dtype=jnp.float32)
-                avg_energy = sum_e / count_f
-                mean_grad = tree_util.tree_map(lambda s: s / count_f, sum_grad_tree)
-                mean_e_grad = tree_util.tree_map(lambda s: s / count_f, sum_e_grad_tree)
-                gradient_tree = tree_util.tree_map(
-                    lambda eg, g: 2.0 * (eg - avg_energy * g),
-                    mean_e_grad,
-                    mean_grad,
-                )
-
-                updates, opt_state = optimizer.update(gradient_tree, opt_state, params)
-                new_params = optax.apply_updates(params, updates)
-
-                variance = sum_e2 / count_f - avg_energy * avg_energy
-                std_energy = jnp.sqrt(jnp.maximum(variance, 0.0))
-                return new_params, opt_state, avg_energy, std_energy
-
-            return _step_fn
-
-        # Precompute static limits and build a per-step jitted function.
-        adamw_step = None
-
-        for opt_step in range(optimization_steps):
-            params = wavefn.params
-
-            chain_kwargs = dict(
-                n_spin_orbitals=ham.n_spin_orbitals,
-                n_sites=ham.n_sites,
-            )
-            if nelec is None:
-                chain_kwargs.update(n_up=n_up, n_dn=n_dn)
-
-            key, electrons, buffer, ptr, acceptance = metropolis_chain(
-                wavefn,
-                key,
-                electrons,
-                total_steps,
-                thermalization_steps,
-                thin_stride,
-                **chain_kwargs,
-            )
-
-            sample_count = int(ptr)
-            samples = buffer[:sample_count]
-            acceptance_rate = float(acceptance)
-
-            if sample_count > 0:
-                if minibatch_size is None or minibatch_size <= 0:
-                    batch_size = max(1, n_samples)
-                else:
-                    batch_size = minibatch_size
-                max_chunks = (n_samples + batch_size - 1) // batch_size
-
-                if adamw_step is None or (
-                    getattr(adamw_step, "_batch_size", None) != batch_size
-                    or getattr(adamw_step, "_max_chunks", None) != max_chunks
-                ):
-                    adamw_step = _make_adamw_step(batch_size, max_chunks)
-                    adamw_step._batch_size = batch_size
-                    adamw_step._max_chunks = max_chunks
-
-                new_params, opt_state, avg_energy_j, std_energy_j = adamw_step(
-                    params,
-                    opt_state,
-                    samples,
-                    jnp.asarray(sample_count, dtype=jnp.int32),
-                )
-                wavefn.set_params(new_params)
-
-                avg_energy_value = float(jax.device_get(avg_energy_j))
-                std_energy_value = float(jax.device_get(std_energy_j))
-
-                # Omit per-sample energy recording in results to save memory.
-            else:
-                avg_energy_value = 0.0
-                std_energy_value = 0.0
-
-            print(
-                f"[Neural] Step {opt_step + 1}/{optimization_steps} | "
-                f"Energy = {avg_energy_value:.6f} ± {std_energy_value:.6f} | "
-                f"Acceptance = {acceptance_rate:.3f}"
-            )
-            mean_history.append(float(avg_energy_value))
-            std_history.append(float(std_energy_value))
+        (
+            avg_energy_value,
+            std_energy_value,
+            acceptance_rate,
+            mean_history,
+            std_history,
+            key,
+            electrons,
+            opt_state,
+        ) = _adamw_training_loop(
+            wavefn,
+            ham,
+            t_matrix,
+            connections,
+            total_steps=total_steps,
+            thermalization_steps=thermalization_steps,
+            thin_stride=thin_stride,
+            optimization_steps=optimization_steps,
+            key=key,
+            electrons=electrons,
+            nelec=nelec,
+            n_up=n_up,
+            n_dn=n_dn,
+            optimizer=optimizer,
+            opt_state=opt_state,
+            minibatch_size=minibatch_size,
+        )
 
     if param_path:
         save_params(wavefn.params, param_path)
